@@ -1,0 +1,24 @@
+### This is a Docker multistage build, you'll need Docker 17.05 for it
+### Or it can be just a single stage
+
+FROM openjdk:8u121-jdk
+
+ADD *.java /
+
+RUN mkdir /build
+#RUN /jdkbuild/custom/build/linux-x86_64-normal-server-release/images/j2sdk-image/bin/javac -d /build /*.java
+RUN javac -d /build /*.java
+RUN cd /build && ls -alht && jar cvf HelloWorld.jar *
+
+FROM openjdk:8u121-jre
+
+COPY --from=0 /build /build
+
+###
+### for jmap -clstats and similar to work, you'll need some debuginfo for symbols
+###
+
+RUN dpkg -l openjdk-8\* | grep ^ii | awk '{ print $3 }' | xargs -I{} curl -O http://ftp.debian.org/debian/pool/main/o/openjdk-8/openjdk-8-dbg_{}_amd64.deb
+RUN dpkg -i *.deb
+
+CMD [ "java", "-cp", "/build/HelloWorld.jar", "org.example.com.HelloWorld" ]

@@ -1,0 +1,252 @@
+# HG changeset patch
+# User Timothy J Fontaine <tj.fontaine@oracle.com>
+# Date 1493445530 25200
+#      Fri Apr 28 22:58:50 2017 -0700
+# Node ID f431915f3411bf20b353993d3867b996984bbc34
+# Parent  6f412fc77f232e739c969e9de883b29611f4cd91
+agent resolve file paths relative to /proc/pid/root
+
+When attaching to a target JVM that does not share the same mount namespace
+(Docker container or chroot) file paths should be resolved relative to
+`/proc/pid/root`.
+
+diff -r 6f412fc77f23 -r f431915f3411 src/jdk.hotspot.agent/linux/native/libsaproc/libproc_impl.c
+--- a/hotspot/src/jdk.hotspot.agent/linux/native/libsaproc/libproc_impl.c	Fri Apr 28 18:10:28 2017 +0100
++++ b/hotspot/src/jdk.hotspot.agent/linux/native/libsaproc/libproc_impl.c	Fri Apr 28 22:58:50 2017 -0700
+@@ -31,7 +31,7 @@
+ 
+ #define SA_ALTROOT "SA_ALTROOT"
+ 
+-int pathmap_open(const char* name) {
++int pathmap_open(const char* name, pid_t pid) {
+   static const char *alt_root = NULL;
+   static int alt_root_initialized = 0;
+ 
+@@ -46,7 +46,15 @@
+   }
+ 
+   if (alt_root == NULL) {
+-    return open(name, O_RDONLY);
++    if (pid > -1) {
++      snprintf(alt_path, PATH_MAX, "/proc/%d/root", pid);
++      strcat(alt_path, name);
++      alt_path[PATH_MAX] = '\0';
++      return open(alt_path, O_RDONLY);
++    } else {
++      print_debug("unable to open path %s relative to process", name);
++      return open(name, O_RDONLY);
++    }
+   }
+ 
+ 
+@@ -179,7 +187,7 @@
+    newlib->base = base;
+ 
+    if (fd == -1) {
+-      if ( (newlib->fd = pathmap_open(newlib->name)) < 0) {
++      if ( (newlib->fd = pathmap_open(newlib->name, ph->pid)) < 0) {
+          print_debug("can't open shared object %s\n", newlib->name);
+          free(newlib);
+          return NULL;
+@@ -196,7 +204,7 @@
+       return NULL;
+    }
+ 
+-   newlib->symtab = build_symtab(newlib->fd, libname);
++   newlib->symtab = build_symtab(newlib->fd, libname, ph->pid);
+    if (newlib->symtab == NULL) {
+       print_debug("symbol table build failed for %s\n", newlib->name);
+    }
+diff -r 6f412fc77f23 -r f431915f3411 src/jdk.hotspot.agent/linux/native/libsaproc/libproc_impl.h
+--- a/hotspot/src/jdk.hotspot.agent/linux/native/libsaproc/libproc_impl.h	Fri Apr 28 18:10:28 2017 +0100
++++ b/hotspot/src/jdk.hotspot.agent/linux/native/libsaproc/libproc_impl.h	Fri Apr 28 22:58:50 2017 -0700
+@@ -102,7 +102,7 @@
+    struct core_data*  core;      // data only used for core dumps, NULL for process
+ };
+ 
+-int pathmap_open(const char* name);
++int pathmap_open(const char* name, pid_t pid);
+ 
+ void print_debug(const char* format,...);
+ void print_error(const char* format,...);
+diff -r 6f412fc77f23 -r f431915f3411 src/jdk.hotspot.agent/linux/native/libsaproc/ps_core.c
+--- a/hotspot/src/jdk.hotspot.agent/linux/native/libsaproc/ps_core.c	Fri Apr 28 18:10:28 2017 +0100
++++ b/hotspot/src/jdk.hotspot.agent/linux/native/libsaproc/ps_core.c	Fri Apr 28 22:58:50 2017 -0700
+@@ -343,7 +343,7 @@
+ 
+       print_debug("looking for %s\n", classes_jsa);
+       // open the class sharing archive file
+-      fd = pathmap_open(classes_jsa);
++      fd = pathmap_open(classes_jsa, ph->pid);
+       if (fd < 0) {
+         print_debug("can't open %s!\n", classes_jsa);
+         ph->core->classes_jsa_fd = -1;
+@@ -835,7 +835,7 @@
+       interp_name[exec_php->p_filesz] = '\0';
+       print_debug("ELF interpreter %s\n", interp_name);
+       // read interpreter segments as well
+-      if ((ph->core->interp_fd = pathmap_open(interp_name)) < 0) {
++      if ((ph->core->interp_fd = pathmap_open(interp_name, ph->pid)) < 0) {
+         print_debug("can't open runtime loader\n");
+         goto err;
+       }
+@@ -967,7 +967,7 @@
+ 
+       if (lib_name[0] != '\0') {
+          // ignore empty lib names
+-         lib_fd = pathmap_open(lib_name);
++         lib_fd = pathmap_open(lib_name, ph->pid);
+ 
+          if (lib_fd < 0) {
+             print_debug("can't open shared object %s\n", lib_name);
+diff -r 6f412fc77f23 -r f431915f3411 src/jdk.hotspot.agent/linux/native/libsaproc/symtab.c
+--- a/hotspot/src/jdk.hotspot.agent/linux/native/libsaproc/symtab.c	Fri Apr 28 18:10:28 2017 +0100
++++ b/hotspot/src/jdk.hotspot.agent/linux/native/libsaproc/symtab.c	Fri Apr 28 22:58:50 2017 -0700
+@@ -131,12 +131,12 @@
+ /* Open a debuginfo file and check its CRC.  If it exists and the CRC
+    matches return its fd.  */
+ static int
+-open_debug_file (const char *pathname, unsigned int crc)
++open_debug_file (const char *pathname, unsigned int crc, pid_t pid)
+ {
+   unsigned int file_crc = 0;
+   unsigned char buffer[8 * 1024];
+ 
+-  int fd = pathmap_open(pathname);
++  int fd = pathmap_open(pathname, pid);
+ 
+   if (fd < 0)
+     return -1;
+@@ -194,7 +194,8 @@
+ static int open_file_from_debug_link(const char *name,
+                                      int fd,
+                                      ELF_EHDR *ehdr,
+-                                     struct elf_section *scn_cache)
++                                     struct elf_section *scn_cache,
++                                     pid_t pid)
+ {
+   int debug_fd;
+   struct elf_section *debug_link = find_section_by_name(".gnu_debuglink", fd, ehdr,
+@@ -219,7 +220,7 @@
+ 
+   /* Look in the same directory as the object.  */
+   strcpy(last_slash+1, debug_filename);
+-  debug_fd = open_debug_file(debug_pathname, crc);
++  debug_fd = open_debug_file(debug_pathname, crc, pid);
+   if (debug_fd >= 0) {
+     free(debug_pathname);
+     return debug_fd;
+@@ -229,7 +230,7 @@
+   strcpy(last_slash+1, ".debug/");
+   strcat(last_slash, debug_filename);
+ 
+-  debug_fd = open_debug_file(debug_pathname, crc);
++  debug_fd = open_debug_file(debug_pathname, crc, pid);
+   if (debug_fd >= 0) {
+     free(debug_pathname);
+     return debug_fd;
+@@ -241,7 +242,7 @@
+   last_slash = strrchr(debug_pathname, '/');
+   strcpy(last_slash+1, debug_filename);
+ 
+-  debug_fd = open_debug_file(debug_pathname, crc);
++  debug_fd = open_debug_file(debug_pathname, crc, pid);
+   if (debug_fd >= 0) {
+     free(debug_pathname);
+     return debug_fd;
+@@ -251,19 +252,20 @@
+   return -1;
+ }
+ 
+-static struct symtab* build_symtab_internal(int fd, const char *filename, bool try_debuginfo);
++static struct symtab* build_symtab_internal(int fd, const char *filename, bool try_debuginfo, pid_t pid);
+ 
+ /* Look for a ".gnu_debuglink" section.  If one exists, try to open a
+    suitable debuginfo file and read a symbol table from it.  */
+ static struct symtab *build_symtab_from_debug_link(const char *name,
+                                      int fd,
+                                      ELF_EHDR *ehdr,
+-                                     struct elf_section *scn_cache)
++                                     struct elf_section *scn_cache,
++                                     pid_t pid)
+ {
+-  fd = open_file_from_debug_link(name, fd, ehdr, scn_cache);
++  fd = open_file_from_debug_link(name, fd, ehdr, scn_cache, pid);
+ 
+   if (fd >= 0) {
+-    struct symtab *symtab = build_symtab_internal(fd, NULL, /* try_debuginfo */ false);
++    struct symtab *symtab = build_symtab_internal(fd, NULL, /* try_debuginfo */ false, pid);
+     close(fd);
+     return symtab;
+   }
+@@ -296,7 +298,7 @@
+ 
+ // Read a build ID note.  Try to open any associated debuginfo file
+ // and return its symtab
+-static struct symtab* build_symtab_from_build_id(Elf64_Nhdr *note)
++static struct symtab* build_symtab_from_build_id(Elf64_Nhdr *note, pid_t pid)
+ {
+   int fd;
+   struct symtab *symtab = NULL;
+@@ -306,9 +308,9 @@
+   char *filename
+     = (build_id_to_debug_filename (note->n_descsz, bytes));
+ 
+-  fd = pathmap_open(filename);
++  fd = pathmap_open(filename, pid);
+   if (fd >= 0) {
+-    symtab = build_symtab_internal(fd, NULL, /* try_debuginfo */ false);
++    symtab = build_symtab_internal(fd, NULL, /* try_debuginfo */ false, pid);
+     close(fd);
+   }
+   free(filename);
+@@ -318,7 +320,7 @@
+ 
+ // read symbol table from given fd.  If try_debuginfo) is true, also
+ // try to open an associated debuginfo file
+-static struct symtab* build_symtab_internal(int fd, const char *filename, bool try_debuginfo) {
++static struct symtab* build_symtab_internal(int fd, const char *filename, bool try_debuginfo, pid_t pid) {
+   ELF_EHDR ehdr;
+   char *names = NULL;
+   struct symtab* symtab = NULL;
+@@ -491,7 +493,7 @@
+       if (cursct->sh_type == SHT_NOTE) {
+         Elf64_Nhdr *note = (Elf64_Nhdr *)scn_cache[cnt].c_data;
+         if (note->n_type == NT_GNU_BUILD_ID) {
+-          symtab = build_symtab_from_build_id(note);
++          symtab = build_symtab_from_build_id(note, pid);
+         }
+       }
+       cursct++;
+@@ -501,7 +503,7 @@
+     // Then, if that doesn't work, the debug link
+     if (symtab == NULL) {
+       symtab = build_symtab_from_debug_link(filename, fd, &ehdr,
+-                                            scn_cache);
++                                            scn_cache, pid);
+     }
+ 
+     // If we still haven't found a symtab, use the object's own symtab.
+@@ -527,8 +529,8 @@
+   return symtab;
+ }
+ 
+-struct symtab* build_symtab(int fd, const char *filename) {
+-  return build_symtab_internal(fd, filename, /* try_debuginfo */ true);
++struct symtab* build_symtab(int fd, const char *filename, pid_t pid) {
++  return build_symtab_internal(fd, filename, /* try_debuginfo */ true, pid);
+ }
+ 
+ 
+diff -r 6f412fc77f23 -r f431915f3411 src/jdk.hotspot.agent/linux/native/libsaproc/symtab.h
+--- a/hotspot/src/jdk.hotspot.agent/linux/native/libsaproc/symtab.h	Fri Apr 28 18:10:28 2017 +0100
++++ b/hotspot/src/jdk.hotspot.agent/linux/native/libsaproc/symtab.h	Fri Apr 28 22:58:50 2017 -0700
+@@ -32,7 +32,7 @@
+ struct symtab;
+ 
+ // build symbol table for a given ELF file descriptor
+-struct symtab* build_symtab(int fd, const char *filename);
++struct symtab* build_symtab(int fd, const char *filename, pid_t pid);
+ 
+ // destroy the symbol table
+ void destroy_symtab(struct symtab* symtab);

@@ -1,0 +1,146 @@
+# HG changeset patch
+# User Timothy J Fontaine <tj.fontaine@oracle.com>
+# Date 1493444072 25200
+#      Fri Apr 28 22:34:32 2017 -0700
+# Node ID a74f26a90d9f44894d8921e398a86fbb2f9ea9fd
+# Parent  42ffb45db3ee3feb6268f8f5a6b903e3177811b6
+attach in linux should be relative to /proc/pid/root and namespace aware
+
+Diagnostic commands (i.e. jcmd, jstack, etc) fail to attach to a target JVM
+that is inside a container (e.g. Docker).
+
+A Linux container often isolates a process in a PID and Mount namespace that is
+separate from the "root container" (analogous to the hypervisor/dom0 in
+hardware virtualization environments, or the global zone on Solaris). A target
+JVM that is isolated in either a PID namespace, or a Mount namespace will fail
+the attach sequence.
+
+When the target JVM is in its own PID namespace the pid of the process is
+distinct from what the real pid of the process as it relates to the root
+container. For example, in the root container you can observe a JVM with a pid
+of 17734, however if that JVM is running inside a Docker container the pid
+inside its PID namespace is likely 1. So when the target JVM receives the
+SIGQUIT it looks in /proc/self/cwd/ for .attach_pid1 however the external
+attaching JVM has created the file /proc/17734/cwd/.attach_pid17734. Given this
+discrepancy the target JVM will output to stderr thread status, since
+/proc/self/cwd/.attach_pid1 doesn't exist and won't continue with the attach
+sequence.
+
+The solution is to parse /proc/pid/status for the field NSpid (available since
+Linux 4.1) which contains a list of pids, where the last entry is the "inner
+most" PID namespace value. (Namespaces can be stacked, unlike Solaris Zones
+which have a virtualization depth of 1)
+
+The rest of the Linux attach sequence assumes a shared mount namespace by
+waiting for /tmp/.java_pid17734 to appear. But if the attaching process is in a
+separate namespace because the target JVM is in a mount namepsace (or in a
+chroot as well) the unix domain socket for attaching won't appear.
+
+Instead the attach sequence should resolve file names relative to
+/proc/17734/root which has a materialized view of the rootfs for the target.
+
+diff -r 42ffb45db3ee -r a74f26a90d9f src/jdk.attach/linux/classes/sun/tools/attach/VirtualMachineImpl.java
+--- a/jdk/src/jdk.attach/linux/classes/sun/tools/attach/VirtualMachineImpl.java	Thu Apr 27 05:31:50 2017 +0000
++++ b/jdk/src/jdk.attach/linux/classes/sun/tools/attach/VirtualMachineImpl.java	Fri Apr 28 22:34:32 2017 -0700
+@@ -32,6 +32,10 @@
+ import java.io.InputStream;
+ import java.io.IOException;
+ import java.io.File;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.nio.file.Files;
+ 
+ /*
+  * Linux implementation of HotSpotVirtualMachine
+@@ -63,12 +67,20 @@
+             throw new AttachNotSupportedException("Invalid process identifier");
+         }
+ 
++        // Try and resolve to the "inner most" pid namespace
++        int ns_pid;
++        try {
++            ns_pid = getNamespacePid(pid);
++        } catch (NumberFormatException x) {
++            throw new AttachNotSupportedException("Unable to parse namespace");
++        }
++
+         // Find the socket file. If not found then we attempt to start the
+         // attach mechanism in the target VM by sending it a QUIT signal.
+         // Then we attempt to find the socket file again.
+-        path = findSocketFile(pid);
++        path = findSocketFile(pid, ns_pid);
+         if (path == null) {
+-            File f = createAttachFile(pid);
++            File f = createAttachFile(pid, ns_pid);
+             try {
+                 sendQuitTo(pid);
+ 
+@@ -83,7 +95,7 @@
+                     try {
+                         Thread.sleep(delay);
+                     } catch (InterruptedException x) { }
+-                    path = findSocketFile(pid);
++                    path = findSocketFile(pid, ns_pid);
+ 
+                     time_spend += delay;
+                     if (time_spend > timeout/2 && path == null) {
+@@ -261,8 +273,12 @@
+     }
+ 
+     // Return the socket file for the given process.
+-    private String findSocketFile(int pid) {
+-        File f = new File(tmpdir, ".java_pid" + pid);
++    private String findSocketFile(int pid, int ns_pid) {
++        // A process may not exist in the same mount namespace as the caller.
++        // Instead, attach relative to the target root filesystem as exposed by
++        // procfs regardless of namespaces.
++        String root = "/proc/" + pid + "/root/" + tmpdir;
++        File f = new File(root, ".java_pid" + ns_pid);
+         if (!f.exists()) {
+             return null;
+         }
+@@ -273,8 +289,8 @@
+     // if not already started. The client creates a .attach_pid<pid> file in the
+     // target VM's working directory (or temp directory), and the SIGQUIT handler
+     // checks for the file.
+-    private File createAttachFile(int pid) throws IOException {
+-        String fn = ".attach_pid" + pid;
++    private File createAttachFile(int pid, int ns_pid) throws IOException {
++        String fn = ".attach_pid" + ns_pid;
+         String path = "/proc/" + pid + "/cwd/" + fn;
+         File f = new File(path);
+         try {
+@@ -306,6 +322,32 @@
+     }
+ 
+ 
++    // Return the inner most namespaced PID if there is one,
++    // otherwise return the original PID
++    private int getNamespacePid(int pid) throws IOException, NumberFormatException {
++        // Assuming a real procfs sits beneath, reading this doesn't block
++        // nor will it consume a lot of memory
++        String statusFile = "/proc/" + pid + "/status";
++        Path statusPath = Paths.get(statusFile);
++
++        for (String line : Files.readAllLines(statusPath, StandardCharsets.UTF_8)) {
++            String[] parts = line.split(":");
++            if (parts.length == 2 && parts[0].trim().equals("NSpid")) {
++                parts = parts[1].trim().split("\\s+");
++                // The last entry represents the PID the JVM "thinks" it is.
++                // Even in non-namespaced pids these entries should be
++                // valid. You could refer to it as the inner most pid.
++                int ns_pid = Integer.parseInt(parts[parts.length - 1]);
++                return ns_pid;
++            }
++        }
++
++        // TODO XXX friggin old kernels may not have NSpid field (i.e. 3.10)
++        // fallback to original pid in the event we cannot deduce
++        return pid;
++    }
++
++
+     //-- native methods
+ 
+     static native void sendQuitToChildrenOf(int pid) throws IOException;

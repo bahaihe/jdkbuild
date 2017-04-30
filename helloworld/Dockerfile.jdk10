@@ -1,0 +1,8 @@
+FROM jdkbuild-jdk10:latest
+
+ADD *.java /
+
+RUN /jdkbuild/custom/build/linux-x86_64-normal-server-release/images/jdk/bin/javac -d /build /*.java
+RUN cd /build && ls -alht && jar cvf HelloWorld.jar *
+
+CMD [ "/jdkbuild/custom/build/linux-x86_64-normal-server-release/images/jdk/bin/java", "-cp", "/build/HelloWorld.jar", "org.example.com.HelloWorld" ]

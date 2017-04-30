@@ -1,0 +1,23 @@
+FROM oraclelinux:latest
+
+RUN rm -rf /etc/yum.repos.d/*.repo
+
+ADD *.rpm /
+
+RUN yum install -y *.rpm && \
+    rm *.rpm
+
+RUN yum groupinstall -y "Development Tools" && \
+    yum install -y \
+	java-1.8.0-openjdk-devel \
+	libXtst-devel \
+	libXt-devel \
+	libXrender-devel \
+	cups-devel \
+	alsa-lib-devel \
+	freetype-devel \
+        elfutils-libelf-devel \
+	file \
+	which && \
+   yum clean all
+
